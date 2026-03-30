@@ -33,6 +33,9 @@ import warnings
 from pathlib import Path
 from datetime import datetime
 import pickle
+from itertools import combinations
+from statsmodels.stats.contingency_tables import mcnemar as mcnemar_test
+from statsmodels.stats.multitest import multipletests
 
 warnings.filterwarnings('ignore')
 
@@ -1370,6 +1373,164 @@ def save_data(conv_df, speed_df, overfit_df, output_dir):
     print(f"✓ Saved: {output_path}")
 
 
+def run_mcnemar_tests(results, alpha=0.05):
+    """
+    Pairwise McNemar's test between all model pairs for each dataset.
+
+    Requires 'test_preds' and 'test_labels' stored in results (saved during training).
+    Uses exact test when off-diagonal cell count < 25, chi-square otherwise.
+    Applies Holm-Bonferroni correction for multiple comparisons.
+
+    Returns dict mapping dataset_name -> DataFrame with columns:
+        model_a, model_b, n11, n10, n01, n00, statistic, p_value, p_corrected, significant
+    """
+    mcnemar_results = {}
+
+    for dataset_name, models_data in results.items():
+        models_with_preds = {
+            model_name: {
+                'preds': np.array(model_data['test_preds']),
+                'labels': np.array(model_data['test_labels'])
+            }
+            for model_name, model_data in models_data.items()
+            if 'test_preds' in model_data and 'test_labels' in model_data
+        }
+
+        if len(models_with_preds) < 2:
+            print(f"  Skipping {dataset_name}: no per-sample predictions stored")
+            continue
+
+        model_names = list(models_with_preds.keys())
+        rows = []
+
+        for model_a, model_b in combinations(model_names, 2):
+            preds_a = models_with_preds[model_a]['preds']
+            preds_b = models_with_preds[model_b]['preds']
+            labels = models_with_preds[model_a]['labels']
+
+            correct_a = (preds_a == labels)
+            correct_b = (preds_b == labels)
+
+            # 2x2 contingency table:
+            # [[both correct,   A correct B wrong],
+            #  [A wrong B correct, both wrong    ]]
+            n11 = int(np.sum(correct_a & correct_b))
+            n10 = int(np.sum(correct_a & ~correct_b))
+            n01 = int(np.sum(~correct_a & correct_b))
+            n00 = int(np.sum(~correct_a & ~correct_b))
+
+            table = np.array([[n11, n10], [n01, n00]])
+
+            try:
+                use_exact = (n10 + n01) < 25
+                result = mcnemar_test(table, exact=use_exact, correction=not use_exact)
+                rows.append({
+                    'model_a': model_a,
+                    'model_b': model_b,
+                    'n11': n11, 'n10': n10, 'n01': n01, 'n00': n00,
+                    'statistic': result.statistic,
+                    'p_value': result.pvalue,
+                })
+            except Exception as e:
+                print(f"  Warning: McNemar failed for {model_a} vs {model_b}: {e}")
+
+        if not rows:
+            continue
+
+        df = pd.DataFrame(rows)
+
+        # Holm-Bonferroni correction for all pairs within the dataset
+        reject, p_corrected, _, _ = multipletests(df['p_value'], alpha=alpha, method='holm')
+        df['p_corrected'] = p_corrected
+        df['significant'] = reject
+
+        mcnemar_results[dataset_name] = df
+
+        print(f"\n{dataset_name}: {len(df)} pairwise comparisons, "
+              f"{reject.sum()} significant (Holm α={alpha})")
+
+    return mcnemar_results
+
+
+def plot_mcnemar_heatmap(mcnemar_results, output_dir, alpha=0.05):
+    """Plot Holm-corrected p-value heatmaps for McNemar pairwise tests per dataset."""
+    if not mcnemar_results:
+        print("No McNemar results to plot (missing per-sample predictions).")
+        return
+
+    n_datasets = len(mcnemar_results)
+    fig, axes = plt.subplots(1, n_datasets, figsize=(6 * n_datasets, 5))
+    if n_datasets == 1:
+        axes = [axes]
+
+    fig.suptitle(
+        "McNemar's Test — Corrected p-values Between Model Pairs\n"
+        f"(Holm-Bonferroni, * = significant at α={alpha})",
+        fontsize=14, fontweight='bold'
+    )
+
+    for ax, (dataset_name, df) in zip(axes, mcnemar_results.items()):
+        all_models = sorted(set(df['model_a'].tolist() + df['model_b'].tolist()))
+        n = len(all_models)
+        model_idx = {m: i for i, m in enumerate(all_models)}
+
+        pval_matrix = np.full((n, n), np.nan)
+        sig_matrix = np.zeros((n, n), dtype=bool)
+
+        for _, row in df.iterrows():
+            i = model_idx[row['model_a']]
+            j = model_idx[row['model_b']]
+            pval_matrix[i, j] = row['p_corrected']
+            pval_matrix[j, i] = row['p_corrected']
+            sig_matrix[i, j] = row['significant']
+            sig_matrix[j, i] = row['significant']
+
+        short_names = [m.replace('efficientnet_', 'EffNet_') for m in all_models]
+        pval_df = pd.DataFrame(pval_matrix, index=short_names, columns=short_names)
+
+        sns.heatmap(
+            pval_df, annot=True, fmt='.3f', cmap='RdYlGn_r',
+            ax=ax, vmin=0, vmax=1,
+            cbar_kws={'label': 'p-value (Holm-corrected)'},
+            linewidths=0.5, mask=np.isnan(pval_matrix)
+        )
+
+        # Overlay asterisk on significant cells
+        for i in range(n):
+            for j in range(n):
+                if i != j and sig_matrix[i, j]:
+                    ax.text(j + 0.5, i + 0.75, '*', ha='center', va='center',
+                            fontsize=14, fontweight='bold', color='black')
+
+        dataset_short = dataset_name.replace('_norm', '')
+        ax.set_title(f'{dataset_short}', fontsize=10, fontweight='bold')
+        ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha='right', fontsize=8)
+        ax.set_yticklabels(ax.get_yticklabels(), rotation=0, fontsize=8)
+
+    plt.tight_layout()
+    output_path = Path(output_dir) / 'mcnemar_pvalues_heatmap.png'
+    plt.savefig(output_path, dpi=DPI, bbox_inches='tight')
+    print(f"✓ Saved: {output_path}")
+    plt.close()
+
+
+def save_mcnemar_results(mcnemar_results, output_dir):
+    """Save McNemar pairwise test results to CSV."""
+    if not mcnemar_results:
+        return
+
+    frames = []
+    for dataset_name, df in mcnemar_results.items():
+        df_copy = df.copy()
+        df_copy.insert(0, 'dataset', dataset_name)
+        frames.append(df_copy)
+
+    combined = pd.concat(frames, ignore_index=True)
+    output_path = Path(output_dir) / 'mcnemar_statistical_tests.csv'
+    combined.to_csv(output_path, index=False)
+    print(f"✓ Saved: {output_path}")
+
+
 if __name__ == "__main__":
     # Initialize
     config = Config()
@@ -1455,7 +1616,7 @@ if __name__ == "__main__":
                 )
                 model.load_state_dict(torch.load(final_model_path, map_location=config.DEVICE))
 
-                test_metrics, _, _ = evaluate_model(model, loaders['test'], config.DEVICE)
+                test_metrics, test_preds, test_labels = evaluate_model(model, loaders['test'], config.DEVICE)
 
                 print(f"\nTest Results:")
                 for metric, value in test_metrics.items():
@@ -1465,6 +1626,8 @@ if __name__ == "__main__":
                     'test_metrics': test_metrics,
                     'history': history,
                     'params': trainable_params,
+                    'test_preds': test_preds.tolist(),
+                    'test_labels': test_labels.tolist(),
                 }
 
                 all_results[dataset_name][model_name] = results
@@ -1683,6 +1846,14 @@ if __name__ == "__main__":
 
     # Save data files
     save_data(conv_df, speed_df, overfit_df, output_dir)
+
+    # Statistical significance testing
+    print("\n" + "="*70)
+    print("STATISTICAL SIGNIFICANCE TESTING (McNemar's Test)")
+    print("="*70)
+    mcnemar_results = run_mcnemar_tests(results)
+    plot_mcnemar_heatmap(mcnemar_results, output_dir)
+    save_mcnemar_results(mcnemar_results, output_dir)
 
     print("\n" + "="*70)
     print("✅ ANALYSIS COMPLETE!")

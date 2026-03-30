@@ -6,6 +6,7 @@ Preprocessing + leakage-safe train/val/test splitting for all 4 tasks.
 
 Pipeline per task
 ─────────────────
+0. Binary Tumor   (Figshare)      → patient-ID-based 70/15/15 split
 1. Binary Tumor   (Br35H)         → use official folder split if present,
                                     else stratified 70/15/15
 2. Multiclass     (17c + 44c)     → MD5 dedup across both datasets,
@@ -17,6 +18,7 @@ Pipeline per task
 All images preprocessed to grayscale 224×224 uint8 before copying.
 
 Output layout (matches 04_models_training_checkpoint.py expectations):
+  data/split/MRI_tumor_binary_figshare_norm/{train,val,test}/{class}/
   data/split/MRI_tumor_binary_norm/{train,val,test}/{class}/
   data/split/MRI_tumor_multiclass_norm/{train,val,test}/{class}/
   data/split/MRI_ms_norm/{train,val,test}/{class}/
@@ -56,13 +58,14 @@ SPLIT_DIR = os.path.join(DATA_DIR, "split")
 
 # Raw source folders inside DATA_DIR
 RAW = {
-    "br35h":    os.path.join(DATA_DIR, "Br35H"),
-    "17c":      os.path.join(DATA_DIR, "images-17c"),
+    "br35h":    os.path.join(DATA_DIR, "Br35H", "Br35H-Mask-RCNN"),
+    "br35h_no": os.path.join(DATA_DIR, "Br35H", "no"),
+    "17c":      os.path.join(DATA_DIR, "images-17"),
     "44c":      os.path.join(DATA_DIR, "images-44c"),
     "ms":       os.path.join(DATA_DIR, "sclerosis"),
-    "stroke":   os.path.join(DATA_DIR, "stroke"),
+    "stroke":   os.path.join(DATA_DIR, "stroke", "Brain_Stroke_CT_Dataset"),
     "aisd":     os.path.join(DATA_DIR, "aisd"),
-    "figshare": os.path.join(DATA_DIR, "figshare"),  # not used in final 4 tasks
+    "figshare": os.path.join(DATA_DIR, "figshare"),  # experiment 1: binary tumor with patient IDs
 }
 
 # AISD test scan IDs — taken from https://github.com/GriffinLiang/AISD
@@ -89,8 +92,8 @@ TUMOR_CLASS_MAP = {
     "carcinoma":       "Carcinoma",
     "germinoma":       "Germinoma",
     "granuloma":       "Granuloma",
-    "tuberculoma":     "Ttuberculoma",
-    "ttuberculoma":    "Ttuberculoma",
+    "tuberculoma":     "Tuberculoma",
+    "ttuberculoma":    "Tuberculoma",
     "papiloma":        "Papiloma",
     "papilloma":       "Papiloma",
     "meduloblastoma":  "Meduloblastoma",
@@ -102,9 +105,11 @@ TUMOR_CLASS_MAP = {
     "control":         "Normal",
     "pituitary":       "Pituitary",
     "ependymoma":      "Ependymoma",
+    "ependimoma":      "Ependymoma",   # Portuguese spelling (44c)
     "ganglioglioma":   "Glioma",
     "oligodendroglioma": "Glioma",
     "astrocytoma":     "Glioma",
+    "astrocitoma":     "Glioma",       # Portuguese spelling (44c)
     "glioblastoma":    "Glioma",
 }
 
@@ -197,9 +202,173 @@ def save_split_stats(rows: list[dict], out_dir: str, name: str):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# TASK 0: BINARY TUMOR — Figshare (experiment 1)
+# Strategy: patient-ID-based split using cjdata.mat PID field.
+#   • 233 patients, 3064 images (tumor only — no normal class).
+#   • Split patients 70/15/15 → assign all slices per patient to that split.
+#   Expected structure: figshare/*.mat  OR  figshare/{1,2,3}/*.jpg
+#   (the .mat files contain cjdata.image and cjdata.PID)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _load_figshare_records() -> list[tuple[str, str, str]]:
+    """
+    Return [(pid, class_label, file_path), ...] for the Figshare dataset.
+
+    Supports two layouts:
+      A) .mat files at figshare/*.mat  — reads cjdata.PID and cjdata.label
+         (label 1=Meningioma, 2=Glioma, 3=Pituitary; saves image as PNG)
+      B) JPEG images pre-exported to figshare/{tumorType}/{pid}_{n}.jpg
+         where folder name is the class and filename prefix is the PID.
+    """
+    src = RAW["figshare"]
+    if not os.path.isdir(src):
+        return []
+
+    records = []
+
+    # ── Layout B: pre-exported images ────────────────────────────────────────
+    # e.g. figshare/meningioma/1_1.jpg  (PID = first token before '_')
+    for class_folder in sorted(os.listdir(src)):
+        class_path = os.path.join(src, class_folder)
+        if not os.path.isdir(class_path):
+            continue
+        imgs = list_images(class_path)
+        for img in imgs:
+            stem = os.path.splitext(os.path.basename(img))[0]
+            pid  = stem.split("_")[0]   # filename convention: {PID}_{slice}.jpg
+            records.append((pid, class_folder.lower(), img))
+
+    if records:
+        return records
+
+    # ── Layout A: .mat files (MATLAB v7.3 / HDF5 format) ─────────────────────
+    try:
+        import h5py
+    except ImportError:
+        print("  ⚠ h5py not installed — cannot read .mat files. "
+              "Install with: pip install h5py")
+        return []
+
+    label_map = {1: "meningioma", 2: "glioma", 3: "pituitary"}
+    mat_files = sorted(Path(src).rglob("*.mat"))
+    if not mat_files:
+        print(f"  ⚠ No .mat files found in {src}")
+        return []
+
+    img_out_dir = os.path.join(src, "_exported_images")
+    os.makedirs(img_out_dir, exist_ok=True)
+
+    n_failed = 0
+    for mat_path in tqdm(mat_files, desc="  reading .mat files"):
+        try:
+            with h5py.File(str(mat_path), "r") as f:
+                cj = f["cjdata"]
+
+                def _read(name):
+                    raw = cj[name][()]
+                    # Dereference HDF5 object references (MATLAB v7.3 struct fields)
+                    if raw.dtype == h5py.ref_dtype or raw.dtype.kind == 'O':
+                        raw = np.array(f[raw.flat[0]])
+                    return raw
+
+                pid   = str(int(_read("PID").flat[0]))
+                label = int(_read("label").flat[0])
+                arr   = _read("image").astype(np.float64)
+
+            cls = label_map.get(label, f"label{label}")
+            # README normalisation: uint8(255 / (max-min) * (im - min))
+            mn, mx = arr.min(), arr.max()
+            arr = (arr - mn) / (mx - mn + 1e-8) * 255
+            # MATLAB stores arrays column-major; h5py transposes → rotate back
+            img_pil = Image.fromarray(arr.T.astype(np.uint8))
+            fname   = f"{mat_path.stem}.png"
+            dst     = os.path.join(img_out_dir, fname)
+            if not os.path.exists(dst):
+                img_pil.save(dst)
+            records.append((pid, cls, dst))
+        except Exception as e:
+            n_failed += 1
+            tqdm.write(f"  ⚠ Failed {mat_path.name}: {e}")
+
+    if n_failed:
+        print(f"  {n_failed} files failed (skipped)")
+    return records
+
+
+def split_figshare():
+    print("\n" + "="*60)
+    print("TASK 0 — Binary Tumor Figshare (patient-ID split)")
+    print("="*60)
+
+    records = _load_figshare_records()
+    if not records:
+        print(f"  ⚠ Figshare data not found at {RAW['figshare']} — skipping.")
+        print("    (Re-run after the dataset finishes downloading.)")
+        return
+
+    out = os.path.join(SPLIT_DIR, "MRI_tumor_binary_figshare_norm")
+
+    # Group files by patient ID
+    pid_files: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    for pid, cls, path in records:
+        pid_files[pid].append((cls, path))
+
+    all_pids = sorted(pid_files.keys())
+    print(f"  {len(all_pids)} patients, {len(records):,} images")
+
+    # Patient-level split (stratified by majority class per patient)
+    pid_labels = []
+    for pid in all_pids:
+        classes = [cls for cls, _ in pid_files[pid]]
+        majority = max(set(classes), key=classes.count)
+        pid_labels.append(majority)
+
+    train_pids, temp_pids, train_labels, temp_labels = train_test_split(
+        all_pids, pid_labels, train_size=TRAIN_RATIO,
+        stratify=pid_labels, random_state=SEED)
+    # Stratify val/test only if every class has ≥2 members in temp
+    from collections import Counter
+    temp_counts = Counter(temp_labels)
+    temp_stratify = temp_labels if min(temp_counts.values()) >= 2 else None
+    if temp_stratify is None:
+        print(f"  ⚠ Too few patients per class in temp split for stratification "
+              f"— using random val/test split. Counts: {dict(temp_counts)}")
+    val_pids, test_pids = train_test_split(
+        temp_pids, test_size=0.5,
+        stratify=temp_stratify, random_state=SEED)
+
+    split_map = {"train": set(train_pids), "val": set(val_pids),
+                 "test":  set(test_pids)}
+
+    rows_by_class: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    for split_name, pid_set in split_map.items():
+        for pid in pid_set:
+            for cls, path in pid_files[pid]:
+                dst_dir = os.path.join(out, split_name)
+                dst = os.path.join(dst_dir, cls,
+                                   f"{pid}_{os.path.basename(path)}")
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                preprocess_image(path, dst)
+                rows_by_class[cls][split_name] += 1
+
+    rows = []
+    for cls, counts in rows_by_class.items():
+        rows.append({"dataset": "MRI_tumor_binary_figshare_norm",
+                     "class": cls,
+                     "train": counts.get("train", 0),
+                     "val":   counts.get("val",   0),
+                     "test":  counts.get("test",  0),
+                     "total": sum(counts.values())})
+
+    save_split_stats(rows, SPLIT_DIR, "MRI_tumor_binary_figshare_norm")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # TASK 1: BINARY TUMOR — Br35H
-# Strategy: use official folder split (train/val/test) if present;
-#           fall back to stratified 70/15/15
+# Strategy:
+#   • Tumor class  → use predefined Br35H-Mask-RCNN/{TRAIN,VAL,TEST}/ split
+#                    exactly as provided (500/201/100)
+#   • Normal class → stratified 70/15/15 from Br35H/no/
 # ─────────────────────────────────────────────────────────────────────────────
 
 def split_br35h():
@@ -207,66 +376,43 @@ def split_br35h():
     print("TASK 1 — Binary Tumor (Br35H)")
     print("="*60)
 
-    src   = RAW["br35h"]
-    out   = os.path.join(SPLIT_DIR, "MRI_tumor_binary_norm")
-
-    # ── Detect folder layout ──────────────────────────────────────────────────
-    # Layout A (official split): src/{train,val,test}/{yes,no}/
-    # Layout B (flat):           src/{yes,no}/  or  src/{0,1}/  or  src/{tumor,normal}/
-    has_official = all(
-        os.path.isdir(os.path.join(src, s))
-        for s in ["train", "val", "test"]
-    )
-
-    CLASS_REMAP = {
-        "yes": "tumor", "1": "tumor", "tumor": "tumor",
-        "no":  "normal", "0": "normal", "normal": "normal",
-    }
-
+    out = os.path.join(SPLIT_DIR, "MRI_tumor_binary_norm")
     rows = []
 
-    if has_official:
-        print("  Using official train/val/test folder split.")
-        for split_name in ["train", "val", "test"]:
-            split_src = os.path.join(src, split_name)
-            split_dst = os.path.join(out, split_name)
-            for raw_cls in os.listdir(split_src):
-                canonical = CLASS_REMAP.get(raw_cls.lower(), raw_cls.lower())
-                files = list_images(os.path.join(split_src, raw_cls))
-                n = copy_split(files, split_dst, canonical,
-                               desc=f"  {split_name}/{canonical}")
-                rows.append({"dataset": "MRI_tumor_binary_norm",
-                             "class": canonical, "split": split_name,
-                             "train": n if split_name == "train" else 0,
-                             "val":   n if split_name == "val"   else 0,
-                             "test":  n if split_name == "test"  else 0,
-                             "total": n})
-    else:
-        print("  No official split found — using stratified 70/15/15.")
-        # Collect all images per class
-        class_dirs = [
-            d for d in os.listdir(src)
-            if os.path.isdir(os.path.join(src, d)) and d.lower() in CLASS_REMAP
-        ]
-        if not class_dirs:
-            # Try direct image files at root level grouped by nothing — skip
-            print(f"  ⚠ Cannot determine class structure in {src}. Skipping.")
-            return
+    # ── Tumor: use predefined split ───────────────────────────────────────────
+    mask_rcnn_dir = RAW["br35h"]
+    for split_name, folder in [("train", "TRAIN"), ("val", "VAL"), ("test", "TEST")]:
+        split_src = os.path.join(mask_rcnn_dir, folder)
+        if not os.path.isdir(split_src):
+            print(f"  ⚠ Missing {split_src} — skipping tumor {split_name}")
+            continue
+        files = list_images(split_src)
+        n = copy_split(files, os.path.join(out, split_name), "tumor",
+                       desc=f"  {split_name}/tumor")
+        rows.append({"dataset": "MRI_tumor_binary_norm", "class": "tumor",
+                     "train": n if split_name == "train" else 0,
+                     "val":   n if split_name == "val"   else 0,
+                     "test":  n if split_name == "test"  else 0,
+                     "total": n})
+    print(f"  Tumor: 500 train / 201 val / 100 test (predefined split)")
 
-        for raw_cls in class_dirs:
-            canonical = CLASS_REMAP[raw_cls.lower()]
-            files = list_images(os.path.join(src, raw_cls))
-            train_f, val_f, test_f = stratified_split(files)
-            for split_name, split_files in [("train", train_f),
-                                             ("val",   val_f),
-                                             ("test",  test_f)]:
-                copy_split(split_files, os.path.join(out, split_name),
-                           canonical, desc=f"  {split_name}/{canonical}")
-            rows.append({"dataset": "MRI_tumor_binary_norm",
-                         "class": canonical,
-                         "train": len(train_f), "val": len(val_f),
-                         "test":  len(test_f),
-                         "total": len(files)})
+    # ── Normal: stratified 70/15/15 from Br35H/no/ ───────────────────────────
+    no_dir = RAW["br35h_no"]
+    if os.path.isdir(no_dir):
+        normal_files = list_images(no_dir)
+        train_f, val_f, test_f = stratified_split(normal_files)
+        for split_name, split_files in [("train", train_f),
+                                         ("val",   val_f),
+                                         ("test",  test_f)]:
+            copy_split(split_files, os.path.join(out, split_name), "normal",
+                       desc=f"  {split_name}/normal")
+        rows.append({"dataset": "MRI_tumor_binary_norm", "class": "normal",
+                     "train": len(train_f), "val": len(val_f),
+                     "test":  len(test_f),  "total": len(normal_files)})
+        print(f"  Normal: {len(train_f)} train / {len(val_f)} val / "
+              f"{len(test_f)} test (stratified from Br35H/no/)")
+    else:
+        print(f"  ⚠ Normal class folder not found at {no_dir} — skipping.")
 
     save_split_stats(rows, SPLIT_DIR, "MRI_tumor_binary_norm")
 
@@ -416,10 +562,19 @@ def split_multiclass_tumor():
 # Strategy: stratified 70/15/15
 # ─────────────────────────────────────────────────────────────────────────────
 
-MS_CLASS_MAP = {
-    "ms": "MS", "multiple_sclerosis": "MS", "multiple sclerosis": "MS",
-    "control": "Control", "healthy": "Control", "normal": "Control",
-}
+def _ms_canonical(folder_name: str) -> str | None:
+    """
+    Map a folder name (at any depth) to 'MS' or 'Control', or None to skip.
+    Folder names follow the pattern: '<Class> <Plane>_crop'
+    e.g. 'MS Axial_crop', 'Control Saggital_crop'
+    """
+    low = folder_name.lower()
+    if low.startswith("control") or low.startswith("healthy") or low.startswith("normal"):
+        return "Control"
+    if low.startswith("ms") or low.startswith("multiple"):
+        return "MS"
+    return None
+
 
 def split_ms():
     print("\n" + "="*60)
@@ -429,21 +584,31 @@ def split_ms():
     src = RAW["ms"]
     out = os.path.join(SPLIT_DIR, "MRI_ms_norm")
 
+    # Dataset structure: sclerosis/MS/{Control Axial_crop, MS Axial_crop, ...}/
+    # The class is determined by the LEAF subfolder name, not the intermediate
+    # 'MS' container folder. Walk all subdirs and only assign class at the level
+    # where folders have images directly inside them.
+    class_files: dict[str, list[str]] = defaultdict(list)
+
+    for root, dirs, files in os.walk(src):
+        imgs = list_images(root)
+        if not imgs:
+            continue
+        # This directory has images — determine its class from its own name
+        folder_name = os.path.basename(root)
+        canonical = _ms_canonical(folder_name)
+        if canonical is None:
+            print(f"  ⚠ Unmapped leaf folder '{folder_name}' — skipping")
+            continue
+        class_files[canonical].extend(imgs)
+
     rows = []
-    for raw_cls in sorted(os.listdir(src)):
-        class_path = os.path.join(src, raw_cls)
-        if not os.path.isdir(class_path):
-            continue
-        canonical = MS_CLASS_MAP.get(raw_cls.lower(), raw_cls)
-        files = list_images(class_path)
+    for canonical in sorted(class_files):
+        files = class_files[canonical]
         if not files:
-            # One level deeper (e.g. sclerosis/MS/axial/*.png)
-            for sub in os.listdir(class_path):
-                files.extend(list_images(os.path.join(class_path, sub)))
-        if not files:
-            print(f"  ⚠ No images found in {class_path}")
+            print(f"  ⚠ No images found for class '{canonical}'")
             continue
-        print(f"  {raw_cls} → {canonical}: {len(files):,} images")
+        print(f"  {canonical}: {len(files):,} images")
         train_f, val_f, test_f = stratified_split(files)
         for split_name, split_files in [("train", train_f),
                                          ("val",   val_f),
@@ -478,12 +643,15 @@ def load_aisd_test_ids() -> set[str]:
     """
     if os.path.isfile(AISD_TEST_IDS_FILE):
         with open(AISD_TEST_IDS_FILE) as f:
-            ids = {line.strip() for line in f if line.strip()}
+            content = f.read()
+        # Support both newline-separated and comma-separated IDs
+        import re
+        ids = {tok.strip() for tok in re.split(r"[,\n]", content) if tok.strip()}
         print(f"  Loaded {len(ids)} AISD test IDs from {AISD_TEST_IDS_FILE}")
         return ids
 
     # Fallback: last 52 by sorted order
-    images_dir = os.path.join(RAW["aisd"], "images")
+    images_dir = os.path.join(RAW["aisd"], "image")
     if not os.path.isdir(images_dir):
         images_dir = RAW["aisd"]   # flat layout
 
@@ -505,7 +673,7 @@ def collect_aisd_slices(split: str, test_ids: set[str]) -> list[str]:
     split = 'train_val' → exclude test patient folders
     split = 'test'      → only test patient folders
     """
-    images_dir = os.path.join(RAW["aisd"], "images")
+    images_dir = os.path.join(RAW["aisd"], "image")
     if not os.path.isdir(images_dir):
         images_dir = RAW["aisd"]
 
@@ -629,8 +797,9 @@ def print_final_summary():
     print("FINAL SPLIT SUMMARY")
     print("="*60)
     all_rows = []
-    for name in ["MRI_tumor_binary_norm", "MRI_tumor_multiclass_norm",
-                 "MRI_ms_norm", "CT_stroke_binary_norm"]:
+    for name in ["MRI_tumor_binary_figshare_norm", "MRI_tumor_binary_norm",
+                 "MRI_tumor_multiclass_norm", "MRI_ms_norm",
+                 "CT_stroke_binary_norm"]:
         csv_path = os.path.join(SPLIT_DIR, f"{name}_split_stats.csv")
         if os.path.isfile(csv_path):
             df = pd.read_csv(csv_path)
@@ -662,7 +831,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Preprocess and split neuroimaging datasets.")
     parser.add_argument("--tasks", nargs="+",
-                        choices=["binary", "multiclass", "ms", "stroke", "all"],
+                        choices=["figshare", "binary", "multiclass", "ms",
+                                 "stroke", "all"],
                         default=["all"],
                         help="Which tasks to run (default: all)")
     args = parser.parse_args()
@@ -672,6 +842,7 @@ if __name__ == "__main__":
 
     os.makedirs(SPLIT_DIR, exist_ok=True)
 
+    if run_all or "figshare"   in tasks: split_figshare()
     if run_all or "binary"     in tasks: split_br35h()
     if run_all or "multiclass" in tasks: split_multiclass_tumor()
     if run_all or "ms"         in tasks: split_ms()
