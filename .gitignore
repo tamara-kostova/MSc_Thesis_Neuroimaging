@@ -2,3 +2,6 @@ venv
 .jpg
 .png
 data/
+checkpoints/*.pt
+results/benchmarks/*.json
+results/benchmarks/*.csv

@@ -91,6 +91,12 @@ class Config:
     # NEW: Checkpoint saving frequency (save every N epochs)
     CHECKPOINT_FREQ = 2
 
+    # Per-model batch size overrides (for large models that OOM at default BATCH_SIZE)
+    MODEL_BATCH_SIZES = {
+        "efficientnet_b4": 16,
+        "vgg16": 16,
+    }
+
     def __init__(self):
         os.makedirs(self.RESULTS_DIR, exist_ok=True)
         os.makedirs(self.CHECKPOINT_DIR, exist_ok=True)
@@ -776,7 +782,7 @@ def load_and_process_data(json_path):
 # CONFIGURATION (Cell 20 globals)
 # ============================================================================
 
-JSON_PATH = "benchmark_results_20260208_214002.json"
+JSON_PATH = "results/benchmarks/benchmark_results_20260331_203722.json"
 
 # Plot style settings
 plt.style.use('seaborn-v0_8-darkgrid')
@@ -1556,15 +1562,16 @@ if __name__ == "__main__":
         print(f"# DATASET: {dataset_name}")
         print(f"{'#'*70}")
 
-        loaders, class_to_idx = get_data_loaders(
+        # Determine num_classes once using a lightweight loader
+        _loaders, class_to_idx = get_data_loaders(
             dataset_path,
             batch_size=config.BATCH_SIZE,
             num_workers=2
         )
-
         num_classes = len(class_to_idx)
         print(f"Number of classes: {num_classes}")
         print(f"Classes: {list(class_to_idx.keys())}")
+        del _loaders
 
         if dataset_name not in all_results:
             all_results[dataset_name] = {}
@@ -1578,11 +1585,24 @@ if __name__ == "__main__":
             try:
                 print(f"\n--- Training {model_name} ---")
 
+                # Use per-model batch size if specified (avoids OOM for large models)
+                batch_size = config.MODEL_BATCH_SIZES.get(model_name, config.BATCH_SIZE)
+                loaders, _ = get_data_loaders(
+                    dataset_path,
+                    batch_size=batch_size,
+                    num_workers=2
+                )
+                if batch_size != config.BATCH_SIZE:
+                    print(f"  Using batch_size={batch_size} (overridden for {model_name})")
+
                 # Mark as started
                 progress_tracker.mark_started(dataset_name, model_name)
 
                 # Check if we're resuming
                 resume_epoch = progress_tracker.get_resume_info(dataset_name, model_name)
+
+                # Free GPU memory from previous model before allocating the next
+                torch.cuda.empty_cache()
 
                 model = create_model(model_name, num_classes, pretrained=True)
                 model = model.to(config.DEVICE)
@@ -1647,6 +1667,14 @@ if __name__ == "__main__":
                 print(f"❌ Error training {model_name}: {str(e)}")
                 all_results[dataset_name][model_name] = {'error': str(e)}
                 # Don't mark as completed so it can be retried
+            finally:
+                # Always release model and loader memory before next iteration
+                try:
+                    del model
+                except NameError:
+                    pass
+                del loaders
+                torch.cuda.empty_cache()
 
     results_path = os.path.join(
         config.RESULTS_DIR,
@@ -1729,8 +1757,11 @@ if __name__ == "__main__":
         f.write(table)
     print("✓ Saved: FINAL_TABLE.md")
 
-    # Publication figures (Cell 19)
-    results_file_19 = Path(RESULTS_DIR) / "benchmark_results_20260208_214002.json"
+    # Publication figures (Cell 19) — use the latest benchmark results
+    benchmark_files_19 = sorted(Path(RESULTS_DIR).glob("benchmark_results_*.json"))
+    if not benchmark_files_19:
+        raise FileNotFoundError(f"No benchmark results found in {RESULTS_DIR}")
+    results_file_19 = benchmark_files_19[-1]
 
     with open(results_file_19, 'r') as f:
         all_results_19 = json.load(f)
@@ -1821,7 +1852,11 @@ if __name__ == "__main__":
     print("="*70)
 
     OUTPUT_DIR = os.path.join(config.BASE_DIR, "training_analysis_outputs")
-    json_path_analysis = os.path.join(RESULTS_DIR, "benchmark_results_20260208_214002.json")
+    # Use the most recently saved benchmark results file
+    benchmark_files = sorted(Path(RESULTS_DIR).glob("benchmark_results_*.json"))
+    if not benchmark_files:
+        raise FileNotFoundError(f"No benchmark results found in {RESULTS_DIR}")
+    json_path_analysis = str(benchmark_files[-1])
 
     output_dir = OUTPUT_DIR
     Path(output_dir).mkdir(parents=True, exist_ok=True)
