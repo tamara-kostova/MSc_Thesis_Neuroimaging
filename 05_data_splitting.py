@@ -752,22 +752,24 @@ def split_ct_stroke():
     pool_stroke = aisd_trainval + kaggle_stroke
     pool_normal = kaggle_normal
 
-    # ── Stratified 80/20 split of pool into train/val ────────────────────────
+    # ── Stratified 70/15/15 split of pool into train/val/test ────────────────
     def pool_split(files):
         if not files:
-            return [], []
-        train_f, val_f = train_test_split(files, train_size=0.80,
-                                          random_state=SEED, shuffle=True)
-        return train_f, val_f
+            return [], [], []
+        train_f, tmp = train_test_split(files, train_size=0.70,
+                                        random_state=SEED, shuffle=True)
+        val_f, test_f = train_test_split(tmp, test_size=0.50,
+                                         random_state=SEED, shuffle=True)
+        return train_f, val_f, test_f
 
-    train_stroke, val_stroke = pool_split(pool_stroke)
-    train_normal, val_normal = pool_split(pool_normal)
+    train_stroke, val_stroke, _ = pool_split(pool_stroke)   # stroke test = AISD locked set
+    train_normal, val_normal, test_normal = pool_split(pool_normal)
 
     splits_map = {
         "stroke": {"train": train_stroke, "val": val_stroke,
                    "test":  aisd_test},
         "normal": {"train": train_normal, "val": val_normal,
-                   "test":  []},           # no locked normal test slices
+                   "test":  test_normal},
     }
 
     rows = []
