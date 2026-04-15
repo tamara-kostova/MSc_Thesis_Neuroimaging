@@ -5,3 +5,4 @@ data/
 checkpoints/*.pt
 results/benchmarks/*.json
 results/benchmarks/*.csv
+papers/
