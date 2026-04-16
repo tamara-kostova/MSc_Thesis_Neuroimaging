@@ -213,6 +213,23 @@ def load_models(model_names: list[str]) -> dict:
 # LINEAR PROBE
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _extract_features(model, loader) -> tuple:
+    """One-shot feature extraction from a frozen backbone.
+
+    Runs the vision encoder exactly once over the split and caches the
+    results as CPU tensors, eliminating redundant forward passes during
+    the linear-probe training loop.
+    """
+    model.eval()
+    feats, labs = [], []
+    with torch.no_grad():
+        for batch in tqdm(loader, desc="  Extracting features"):
+            f = F.normalize(model.encode_image(batch["image"].to(config.DEVICE)), dim=-1)
+            feats.append(f.cpu())
+            labs.append(batch["class_idx"])
+    return torch.cat(feats), torch.cat(labs)
+
+
 class LinearClassifier(nn.Module):
     def __init__(self, input_dim: int, num_classes: int):
         super().__init__()
@@ -234,6 +251,18 @@ def linear_probe_train(model_info: dict, train_loader, val_loader,
     for p in model.parameters():
         p.requires_grad = False
 
+    # Pre-extract features once — backbone is frozen so features never change
+    print("  Pre-extracting train features...")
+    train_feats, train_labels = _extract_features(model, train_loader)
+    print("  Pre-extracting val features...")
+    val_feats, val_labels     = _extract_features(model, val_loader)
+
+    from torch.utils.data import TensorDataset
+    train_dl = DataLoader(TensorDataset(train_feats, train_labels),
+                          batch_size=config.BATCH_SIZE, shuffle=True)
+    val_dl   = DataLoader(TensorDataset(val_feats,   val_labels),
+                          batch_size=config.BATCH_SIZE, shuffle=False)
+
     classifier = LinearClassifier(model_info["embed_dim"], num_classes).to(config.DEVICE)
     optimizer  = optim.AdamW(classifier.parameters(),
                              lr=config.LEARNING_RATE_LINEAR,
@@ -251,39 +280,36 @@ def linear_probe_train(model_info: dict, train_loader, val_loader,
         # Train
         classifier.train()
         t_loss, t_correct, t_total = 0.0, 0, 0
-        for batch in tqdm(train_loader,
-                          desc=f"Epoch {epoch+1}/{config.NUM_EPOCHS_LINEAR} [Train]"):
-            images = batch["image"].to(config.DEVICE)
-            labels = batch["class_idx"].to(config.DEVICE)
-            with torch.no_grad():
-                features = F.normalize(model.encode_image(images), dim=-1)
-            outputs = classifier(features)
-            loss    = criterion(outputs, labels)
-            optimizer.zero_grad()
+        for features, labels in tqdm(train_dl,
+                                     desc=f"Epoch {epoch+1}/{config.NUM_EPOCHS_LINEAR} [Train]"):
+            features = features.to(config.DEVICE)
+            labels   = labels.to(config.DEVICE)
+            outputs  = classifier(features)
+            loss     = criterion(outputs, labels)
+            optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
             t_loss    += loss.item()
             t_correct += outputs.argmax(1).eq(labels).sum().item()
             t_total   += labels.size(0)
 
-        t_loss /= len(train_loader)
+        t_loss /= len(train_dl)
         t_acc   = t_correct / t_total
 
         # Val
         classifier.eval()
         v_loss, v_correct, v_total = 0.0, 0, 0
         with torch.no_grad():
-            for batch in tqdm(val_loader,
-                              desc=f"Epoch {epoch+1}/{config.NUM_EPOCHS_LINEAR} [Val]"):
-                images   = batch["image"].to(config.DEVICE)
-                labels   = batch["class_idx"].to(config.DEVICE)
-                features = F.normalize(model.encode_image(images), dim=-1)
+            for features, labels in tqdm(val_dl,
+                                         desc=f"Epoch {epoch+1}/{config.NUM_EPOCHS_LINEAR} [Val]"):
+                features = features.to(config.DEVICE)
+                labels   = labels.to(config.DEVICE)
                 outputs  = classifier(features)
                 v_loss  += criterion(outputs, labels).item()
                 v_correct += outputs.argmax(1).eq(labels).sum().item()
                 v_total   += labels.size(0)
 
-        v_loss /= len(val_loader)
+        v_loss /= len(val_dl)
         v_acc   = v_correct / v_total
 
         history["train_loss"].append(t_loss)
@@ -322,12 +348,17 @@ def linear_probe_eval(model_info: dict, classifier, test_loader,
     model.eval()
     classifier.eval()
 
+    print("  Pre-extracting test features...")
+    test_feats, test_labels = _extract_features(model, test_loader)
+
+    from torch.utils.data import TensorDataset
+    test_dl = DataLoader(TensorDataset(test_feats, test_labels),
+                         batch_size=config.BATCH_SIZE, shuffle=False)
+
     all_preds, all_labels, all_probs = [], [], []
     with torch.no_grad():
-        for batch in tqdm(test_loader, desc="Linear probe test"):
-            images   = batch["image"].to(config.DEVICE)
-            labels   = batch["class_idx"]
-            features = F.normalize(model.encode_image(images), dim=-1)
+        for features, labels in tqdm(test_dl, desc="Linear probe test"):
+            features = features.to(config.DEVICE)
             outputs  = classifier(features)
             probs    = F.softmax(outputs, dim=1)
             preds    = outputs.argmax(dim=1)
@@ -462,15 +493,17 @@ def main(datasets: list[str], model_names: list[str]):
         for model_name, model_info in all_models.items():
             pre = model_info["preprocess"]
 
+            # These loaders are used only for one-shot feature extraction;
+            # shuffling is unnecessary here (handled inside TensorDataset loaders).
             train_dl = DataLoader(
                 MedicalImageDataset(dataset, "train", pre),
-                batch_size=config.BATCH_SIZE, shuffle=True,  num_workers=2)
+                batch_size=config.BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
             val_dl   = DataLoader(
                 MedicalImageDataset(dataset, "val",   pre),
-                batch_size=config.BATCH_SIZE, shuffle=False, num_workers=2)
+                batch_size=config.BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
             test_dl  = DataLoader(
                 MedicalImageDataset(dataset, "test",  pre),
-                batch_size=config.BATCH_SIZE, shuffle=False, num_workers=2)
+                batch_size=config.BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
 
             classifier, _ = linear_probe_train(
                 model_info, train_dl, val_dl, num_classes, model_name, dataset)
