@@ -1720,8 +1720,11 @@ if __name__ == "__main__":
     # Results table generation
     RESULTS_DIR = config.RESULTS_DIR
 
-    # Find most recent results file
-    results_file = max(Path(RESULTS_DIR).glob("benchmark_results_*.json"), key=os.path.getctime)
+    # Read back exactly the file this run just wrote. Globbing for the "latest"
+    # file let the table and the figures come from two different runs: this used
+    # max(..., key=os.path.getctime) while the figures below used sorted(...)[-1],
+    # and ctime order and filename order do not have to agree.
+    results_file = results_path
     with open(results_file, 'r') as f:
         all_results = json.load(f)
 
@@ -1757,11 +1760,8 @@ if __name__ == "__main__":
         f.write(table)
     print("✓ Saved: FINAL_TABLE.md")
 
-    # Publication figures (Cell 19) — use the latest benchmark results
-    benchmark_files_19 = sorted(Path(RESULTS_DIR).glob("benchmark_results_*.json"))
-    if not benchmark_files_19:
-        raise FileNotFoundError(f"No benchmark results found in {RESULTS_DIR}")
-    results_file_19 = benchmark_files_19[-1]
+    # Publication figures (Cell 19) — same file as the table above, not a glob.
+    results_file_19 = results_path
 
     with open(results_file_19, 'r') as f:
         all_results_19 = json.load(f)
@@ -1852,11 +1852,8 @@ if __name__ == "__main__":
     print("="*70)
 
     OUTPUT_DIR = os.path.join(config.BASE_DIR, "training_analysis_outputs")
-    # Use the most recently saved benchmark results file
-    benchmark_files = sorted(Path(RESULTS_DIR).glob("benchmark_results_*.json"))
-    if not benchmark_files:
-        raise FileNotFoundError(f"No benchmark results found in {RESULTS_DIR}")
-    json_path_analysis = str(benchmark_files[-1])
+    # Same file as the table and the figures above.
+    json_path_analysis = str(results_path)
 
     output_dir = OUTPUT_DIR
     Path(output_dir).mkdir(parents=True, exist_ok=True)
